@@ -16,8 +16,32 @@
 #include "input-scrub.h"
 #include "sections.h"
 
+/*
+ * The assembler can assemble the trailing +/- by setting either the Y-bit or
+ * the AT-bits.  The default is setting the Y-bit and is the same as specifying:
+ *  -static_branch_prediction_Y_bit
+ *	Treat a single trailing '+' or '-' after a conditional PowerPC branch
+ *	instruction as a static branch prediction that sets the Y-bit in the
+ *	opcode.  Pairs of trailing "++" or "--" always set the AT-bits. This is
+ *	the default for Mac OS X.
+ * This can be changed by specifying:
+ * -static_branch_prediction_AT_bits
+ *	Treat a single trailing '+' or '-' after a conditional PowerPC branch
+ *	instruction as a static branch prediction sets the AT-bits in the
+ *	opcode. Pairs of trailing "++" or "--" always set the AT-bits but with
+ *	this option a warning is issued if this syntax is used.  With this flag 
+ *	the assembler behaves like the IBM tools.
+ */
+enum static_branch_prediction {
+    STATIC_BRANCH_PREDICTION_Y_BIT,
+    STATIC_BRANCH_PREDICTION_AT_BITS
+};
+static int static_branch_prediction_specified = 0;
+static enum static_branch_prediction static_branch_prediction =
+    STATIC_BRANCH_PREDICTION_Y_BIT;
+
 /* relocation type for internal assembler use only for LIKELY_{,NOT_}TAKEN */
-#define PPC_RELOC_BR14_predicted (127)
+#define PPC_RELOC_BR14_predicted (0x10 | PPC_RELOC_BR14)
 enum branch_prediction {
     BRANCH_PREDICTION_NONE,
     BRANCH_PREDICTION_LIKELY_TAKEN,
@@ -397,7 +421,8 @@ static char *parse_num(
     unsigned long parcnt,
     long max_width_zero,
     long zero_only,
-    long signed_num);
+    long signed_num,
+    long bit_mask_with_1_bit_set);
 static char *parse_mbe(
     char *param,
     struct ppc_insn *insn,
@@ -487,6 +512,28 @@ char ***vecP)
 	    break;
 	case 'p':
 	    if(strcmp(*argP, "ppcasm") == 0){
+		*argP = "";
+		return(1);
+	    }
+	    break;
+	case 's':
+	    if(strcmp(*argP, "static_branch_prediction_Y_bit") == 0){
+		if(static_branch_prediction_specified &&
+		   static_branch_prediction != STATIC_BRANCH_PREDICTION_Y_BIT)
+		    as_warn("Can't specify both -static_branch_prediction_Y_bit"
+			    " and -static_branch_prediction_AT_bits");
+		static_branch_prediction_specified = 1;
+		static_branch_prediction = STATIC_BRANCH_PREDICTION_Y_BIT;
+		*argP = "";
+		return(1);
+	    }
+	    else if(strcmp(*argP, "static_branch_prediction_AT_bits") == 0){
+		if(static_branch_prediction_specified &&
+		   static_branch_prediction != STATIC_BRANCH_PREDICTION_AT_BITS)
+		    as_warn("Can't specify both -static_branch_prediction_Y_bit"
+			    " and -static_branch_prediction_AT_bits");
+		static_branch_prediction_specified = 1;
+		static_branch_prediction = STATIC_BRANCH_PREDICTION_AT_BITS;
 		*argP = "";
 		return(1);
 	    }
@@ -629,6 +676,7 @@ char *op)
 
     static char *file_spec;
     static unsigned long line_spec;
+    static int syntax_warning_issued_for_AT_bits = 0;
 
 	/*
 	 * Pick up the instruction and any trailing branch prediction character
@@ -641,21 +689,41 @@ char *op)
 	    end_op = param;
 	if(*end_op == '+'){
 	    if(end_op != start_op && end_op[-1] == '+'){
+		if(static_branch_prediction ==
+		   STATIC_BRANCH_PREDICTION_AT_BITS &&
+		   syntax_warning_issued_for_AT_bits == 0){
+		    as_warning("branch prediction ++/-- syntax always sets the "
+			       "AT-bits");
+		    syntax_warning_issued_for_AT_bits = 1;
+		}
 		prediction = BRANCH_PREDICTION_VERY_LIKELY_TAKEN;
 		end_op[-1] = '\0';
 	    }
 	    else{
-		prediction = BRANCH_PREDICTION_LIKELY_TAKEN;
+		if(static_branch_prediction == STATIC_BRANCH_PREDICTION_AT_BITS)
+		    prediction = BRANCH_PREDICTION_VERY_LIKELY_TAKEN;
+		else
+		    prediction = BRANCH_PREDICTION_LIKELY_TAKEN;
 		*end_op = '\0';
 	    }
 	}
 	else if(*end_op == '-'){
 	    if(end_op != start_op && end_op[-1] == '-'){
+		if(static_branch_prediction ==
+		   STATIC_BRANCH_PREDICTION_AT_BITS &&
+		   syntax_warning_issued_for_AT_bits == 0){
+		    as_warning("branch prediction ++/-- syntax always sets the "
+			       "AT-bits");
+		    syntax_warning_issued_for_AT_bits = 1;
+		}
 		prediction = BRANCH_PREDICTION_VERY_LIKELY_NOT_TAKEN;
 		end_op[-1] = '\0';
 	    }
 	    else{
-		prediction = BRANCH_PREDICTION_LIKELY_NOT_TAKEN;
+		if(static_branch_prediction == STATIC_BRANCH_PREDICTION_AT_BITS)
+		    prediction = BRANCH_PREDICTION_VERY_LIKELY_NOT_TAKEN;
+		else
+		    prediction = BRANCH_PREDICTION_LIKELY_NOT_TAKEN;
 		*end_op = '\0';
 	    }
 	}
@@ -849,7 +917,8 @@ char *op)
 	if(format->cpus != 0 && !force_cpusubtype_ALL){
 	    if(no_ppc601 == 1 && format->cpus == CPU601)
 		as_warning("not allowed 601 instruction \"%s\"", format->name);
-	    if((format->cpus & IMPL64) == IMPL64){
+	    if((format->cpus & IMPL64) == IMPL64 &&
+	        archflag_cpusubtype != CPU_SUBTYPE_POWERPC_970){
 		as_bad("instruction is only for 64-bit implementations (not "
 		       "allowed without -force_cpusubtype_ALL option)");
 	    }
@@ -859,7 +928,8 @@ char *op)
 	    }
 	    if(format->cpus == VMX &&
 	       (archflag_cpusubtype != CPU_SUBTYPE_POWERPC_7400 &&
-	        archflag_cpusubtype != CPU_SUBTYPE_POWERPC_7450)){
+	        archflag_cpusubtype != CPU_SUBTYPE_POWERPC_7450 &&
+	        archflag_cpusubtype != CPU_SUBTYPE_POWERPC_970)){
 		as_bad("vector instruction is optional for the PowerPC (not "
 		       "allowed without -force_cpusubtype_ALL option)");
 	    }
@@ -1043,19 +1113,22 @@ enum branch_prediction prediction)
 		param = parse_crf(param, insn, format, parcnt);
 		break;
 	    case SNUM:
-		param = parse_num(param, insn, format, parcnt, 0, 0, 1);
+		param = parse_num(param, insn, format, parcnt, 0, 0, 1, 0);
+		break;
+	    case FXM:
+		param = parse_num(param, insn, format, parcnt, 0, 0, 0, 1);
 		break;
 	    case NUM:
-		param = parse_num(param, insn, format, parcnt, 0, 0, 0);
+		param = parse_num(param, insn, format, parcnt, 0, 0, 0, 0);
 		break;
 	    case NUM0:
-		param = parse_num(param, insn, format, parcnt, 1, 0, 0);
+		param = parse_num(param, insn, format, parcnt, 1, 0, 0, 0);
 		break;
 	    case MBE:
 		param = parse_mbe(param, insn, format, parcnt);
 		break;
 	    case ZERO:
-		param = parse_num(param, insn, format, parcnt, 0, 1, 0);
+		param = parse_num(param, insn, format, parcnt, 0, 1, 0, 0);
 		break;
 	    case sh:
 		param = parse_sh(param, insn, format, parcnt);
@@ -1111,7 +1184,7 @@ enum branch_prediction prediction)
 			else
 			    insn->opcode |= 0x00400000; /* AT == 10 */
 		    }
-		    else if(bo == 0x04 || bo == 0x14){
+		    else if(bo == 0x10 || bo == 0x12){
 			/*
 			 * For 'decrement the CTR, then branch if the
 			 * decremented CTR is non-zero or zero' the AT bits are
@@ -1509,7 +1582,7 @@ unsigned long parcnt)
 
 	    while(isdigit(*param))
 		if((val = val * 10 + *param++ - '0') >=
-		   1 << format->ops[parcnt].width)
+		   (unsigned long)(1 << format->ops[parcnt].width))
 		return(NULL);
 
 	    if(format->ops[parcnt].type == G0REG && val == 0){
@@ -1794,9 +1867,10 @@ struct ppc_opcode *format,
 unsigned long parcnt,
 long max_width_zero,
 long zero_only,
-long signed_num)
+long signed_num,
+long bit_mask_with_1_bit_set)
 {
-    int val, max, min;
+    int i, val, max, min, mask;
     char *saveptr, save_c;
     expressionS exp;
     segT seg;
@@ -1835,6 +1909,35 @@ long signed_num)
 	    error_param_message = "Parameter error: expression out "
 				  "of range (parameter %lu)";
 	    return(NULL);
+	}
+	if(bit_mask_with_1_bit_set){
+	    mask = 1;
+	    for(i = 0; i < format->ops[parcnt].width; i++){
+		if(mask & val)
+		    break;
+		mask = mask << 1;
+	    }
+	    /*
+	     * If this is the mtcrf opcode (0x7c000120) and val is not zero and
+	     * has exactly one bit set then use the new form of the mtcrf
+	     * opcode.  This has bit 0x00100000 set and the FXM field is a bit
+	     * mask. Else use the old form without bit 0x00100000 set.
+	     */ 
+	    if(insn->opcode == 0x7c000120){
+		if(val != 0 && val == mask)
+		    insn->opcode |= 0x00100000;
+	    }
+	    else{
+		/*
+		 * For instructions other than mtcrf if exactly one bit in val
+		 * is not set it is an error.
+		 */
+		if(val == 0 || val != mask){
+		    error_param_message = "Parameter error: expression must "
+				  "have exactly one bit set (parameter %lu)";
+		    return(NULL);
+		}
+	    }
 	}
 	if(zero_only == 1 && val != 0){
 	    error_param_message = "Parameter error: expression must have a "
@@ -2168,11 +2271,17 @@ int nsect)
 	case PPC_RELOC_BR14_predicted:
 	    if(fixP->fx_pcrel)
 		val += 4;
-	    if((val & 0xffff8000) && ((val & 0xffff8000) != 0xffff8000))
+	    if((val & 0xffff8000) && ((val & 0xffff8000) != 0xffff8000)){
+		layout_file = fixP->file;
+		layout_line = fixP->line;
 		as_warn("Fixup of %ld too large for field width of 16 bits",
                         val);
-	    if((val & 0x3) != 0)
+	    }
+	    if((val & 0x3) != 0){
+		layout_file = fixP->file;
+		layout_line = fixP->line;
 		as_warn("Fixup of %ld is not to a 4 byte address", val);
+	    }
 	    /*
 	     * Note PPC_RELOC_BR14 are only used with bc, "branch conditional"
 	     * instructions.  The Y_BIT was previously set assuming the
@@ -2202,19 +2311,22 @@ int nsect)
 	    }
 	    buf[2] = val >> 8;
 	    buf[3] |= val & 0xfc;
-	    /* change any PPC_RELOC_BR14_predicted back to PPC_RELOC_BR14
-	       before it is used to create a relocation entry. */
-	    fixP->fx_r_type = PPC_RELOC_BR14;
 	    break;
 
 	case PPC_RELOC_BR24:
 	    if(fixP->fx_pcrel)
 		val += 4;
-	    if((val & 0xfc000000) && ((val & 0xfc000000) != 0xfc000000))
+	    if((val & 0xfc000000) && ((val & 0xfc000000) != 0xfc000000)){
+		layout_file = fixP->file;
+		layout_line = fixP->line;
 		as_warn("Fixup of %ld too large for field width of 26 bits",
                         val);
-	    if((val & 0x3) != 0)
+	    }
+	    if((val & 0x3) != 0){
+		layout_file = fixP->file;
+		layout_line = fixP->line;
 		as_warn("Fixup of %ld is not to a 4 byte address", val);
+	    }
 	    buf[0] |= (val >> 24) & 0x03;
 	    buf[1] = val >> 16;
 	    buf[2] = val >> 8;
@@ -2226,6 +2338,8 @@ int nsect)
 	    break;
 
 	default:
+	    layout_file = fixP->file;
+	    layout_line = fixP->line;
 	    as_warn("Bad relocation type");
 	    break;
 	}

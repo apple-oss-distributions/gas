@@ -34,6 +34,7 @@
 #include "sections.h"
 #include "messages.h"
 #include "xmalloc.h"
+#include "input-scrub.h"
 #ifdef I860
 #define RELOC_SECTDIFF	I860_RELOC_SECTDIFF
 #define RELOC_PAIR	I860_RELOC_PAIR
@@ -45,6 +46,7 @@
 #ifdef PPC
 #define RELOC_SECTDIFF	PPC_RELOC_SECTDIFF
 #define RELOC_PAIR	PPC_RELOC_PAIR
+#define PPC_RELOC_BR14_predicted (0x10 | PPC_RELOC_BR14)
 #endif
 #ifdef HPPA
 #define RELOC_SECTDIFF	HPPA_RELOC_SECTDIFF
@@ -139,6 +141,7 @@ char *out_file_name)
     long num_bytes;
     char *symbol_name;
     int fd;
+    unsigned long local;
 
 #ifdef I860
 	I860_tweeks();
@@ -415,19 +418,8 @@ char *out_file_name)
 		/* put the variable repeated part of the frag in the buffer */
 		fill_literal = fragP->fr_literal + fragP->fr_fix;
 		fill_size = fragP->fr_var;
-		know(fragP->fr_offset >= 0);
-		if(fill_size != 0)
-		    num_bytes = fragP->fr_offset % fill_size;
-		else
-		    num_bytes = 0;
-		if (num_bytes){
-		    long zero = 0;
-		    memcpy(output_addr + offset, &zero, num_bytes);
-		    offset += num_bytes;
-		}
-		for(count = fragP->fr_offset-num_bytes;
-		    count > 0;
-		    count -= fill_size){
+		num_bytes = fragP->fr_offset * fragP->fr_var;
+		for(count = 0; count < num_bytes; count += fill_size){
 		    memcpy(output_addr + offset, fill_literal, fill_size);
 		    offset += fill_size;
 		}
@@ -508,10 +500,30 @@ char *out_file_name)
 		    for(isymbolP = frchainP->frch_isym_root;
 			isymbolP != NULL;
 			isymbolP = isymbolP->isy_next){
-
-			memcpy(output_addr + offset,
-			       (char *)(&isymbolP->isy_symbol->sy_number),
-			       sizeof(unsigned long));
+			/*
+			 * If this is a non-lazy pointer symbol section and
+			 * if the symbol is a local symbol then put out
+			 * INDIRECT_SYMBOL_LOCAL as the indirect symbol table
+			 * entry.  This is used with code gen for fix-n-continue
+			 * where the compiler generates indirection for static
+			 * data references.  See the comments at the end of
+			 * fixup_section() that explains the assembly code used.
+			 */
+			if(section_type == S_NON_LAZY_SYMBOL_POINTERS &&
+			   (isymbolP->isy_symbol->sy_nlist.n_type & N_EXT) !=
+			    N_EXT){
+    			    local = INDIRECT_SYMBOL_LOCAL;
+			    if((isymbolP->isy_symbol->sy_nlist.n_type &
+				N_TYPE) == N_ABS)
+				local |= INDIRECT_SYMBOL_ABS;
+			    memcpy(output_addr + offset, (char *)(&local),
+	   			   sizeof(unsigned long));
+			}
+			else{
+			    memcpy(output_addr + offset,
+				   (char *)(&isymbolP->isy_symbol->sy_number),
+				   sizeof(unsigned long));
+			}
 			offset += sizeof(unsigned long);
 		    }
 		}
@@ -562,7 +574,7 @@ char *out_file_name)
 	(void)unlink(out_file_name);
 	if((fd = open(out_file_name, O_WRONLY | O_CREAT | O_TRUNC, 0666)) == -1)
 	    as_fatal("can't create output file: %s", out_file_name);
-	if(write(fd, output_addr, output_size) != output_size)
+	if(write(fd, output_addr, output_size) != (int)output_size)
 	    as_fatal("can't write output file");
 	if(close(fd) == -1)
 	    as_fatal("can't close output file");
@@ -955,9 +967,16 @@ struct relocation_info *riP)
 		riP->r_length = 1;
 		break;
 	    case 4:
+#ifdef PPC
+		if(fixP->fx_r_type == PPC_RELOC_BR14_predicted)
+		    riP->r_length = 3;
+		else
+#endif
 		riP->r_length = 2;
 		break;
 	    default:
+		layout_file = fixP->file;
+		layout_line = fixP->line;
 		as_fatal("Bad fx_size (0x%x) in fix_to_relocation_info()\n",
 			 fixP->fx_size);
 	}
@@ -1002,6 +1021,8 @@ struct relocation_info *riP)
 		    sectdiff = PPC_RELOC_LO16_SECTDIFF;
 		else if(fixP->fx_r_type == PPC_RELOC_HA16)
 		    sectdiff = PPC_RELOC_HA16_SECTDIFF;
+		else if(fixP->fx_r_type == PPC_RELOC_LO14)
+		    sectdiff = PPC_RELOC_LO14_SECTDIFF;
 		else
 #endif
 #ifdef HPPA
@@ -1019,9 +1040,13 @@ struct relocation_info *riP)
 		else
 #endif
 		{
-		    if(fixP->fx_r_type != 0)
-			as_fatal("incorrect fx_r_type (%u) for fx_subsy != 0 "
-				 "in fix_to_relocation_info()",fixP->fx_r_type);
+		    if(fixP->fx_r_type != 0){
+			layout_file = fixP->file;
+			layout_line = fixP->line;
+			as_fatal("Internal error: incorrect fx_r_type (%u) for "
+				 "fx_subsy != 0 in fix_to_relocation_info()",
+				 fixP->fx_r_type);
+		    }
 		    sectdiff = RELOC_SECTDIFF;
 		}
 		memset(&sri, '\0',sizeof(struct scattered_relocation_info));
@@ -1045,7 +1070,8 @@ struct relocation_info *riP)
 				     fixP->fx_subsy->sy_value
 				     + fixP->fx_offset) & 0xffff;
 		}
-		else if(sectdiff == PPC_RELOC_LO16_SECTDIFF){
+		else if(sectdiff == PPC_RELOC_LO16_SECTDIFF ||
+			sectdiff == PPC_RELOC_LO14_SECTDIFF){
 		    sri.r_address = ((symbolP->sy_value -
 				      fixP->fx_subsy->sy_value +
 				      fixP->fx_offset) >> 16) & 0xffff;
